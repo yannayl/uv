@@ -427,6 +427,7 @@ pub(crate) async fn sync(
         dry_run,
         printer,
         preview,
+        matches!(lock_check, LockCheck::Enabled(_)),
     )
     .await
     {
@@ -614,6 +615,7 @@ pub(super) async fn do_sync(
     dry_run: DryRun,
     printer: Printer,
     preview: Preview,
+    locked: bool,
 ) -> Result<(), ProjectError> {
     // Extract the project settings.
     let InstallerSettingsRef {
@@ -767,6 +769,14 @@ pub(super) async fn do_sync(
         .markers(venv.interpreter().markers())
         .platform(venv.interpreter().platform())
         .build();
+
+    // When using --locked mode, remap any packages whose index is not in the available
+    // indexes to use an alternative index with matching hashes.
+    let resolution = if locked {
+        remap_unavailable_indexes(resolution, index_locations, &client).await?
+    } else {
+        resolution
+    };
 
     // Determine whether to enable build isolation.
     let build_isolation = match build_isolation {
@@ -1370,4 +1380,243 @@ impl Report {
             SyncFormat::Text => None,
         }
     }
+}
+
+/// Collect available remote index URLs for quick lookup (as strings for comparison).
+fn collect_available_indexes(
+    index_locations: &uv_distribution_types::IndexLocations,
+) -> std::collections::HashSet<String> {
+    index_locations
+        .indexes()
+        .map(|idx| idx.url().url().to_string())
+        .collect()
+}
+
+/// Identify packages that need remapping because their index is unavailable.
+///
+/// Returns a map of package names that need to be queried for alternative indexes.
+fn identify_packages_needing_remapping(
+    resolution: &Resolution,
+    available_indexes: &std::collections::HashSet<String>,
+) -> rustc_hash::FxHashMap<uv_normalize::PackageName, bool> {
+    use rustc_hash::FxHashMap;
+    use uv_distribution_types::{BuiltDist, Name};
+
+    let mut packages_to_query: FxHashMap<uv_normalize::PackageName, bool> = FxHashMap::default();
+
+    for (dist, hashes) in resolution.hashes() {
+        let ResolvedDist::Installable { dist, .. } = dist else {
+            continue;
+        };
+
+        // Check if this is a registry dist with an unavailable index
+        let index_url_str = match dist.as_ref() {
+            Dist::Built(BuiltDist::Registry(reg)) => {
+                Some(reg.best_wheel().index.url().to_string())
+            }
+            Dist::Source(SourceDist::Registry(reg)) => Some(reg.index.url().to_string()),
+            _ => None,
+        };
+
+        if let Some(url_str) = index_url_str {
+            if !available_indexes.contains(&url_str) && !hashes.is_empty() {
+                packages_to_query.insert(dist.name().clone(), true);
+            }
+        }
+    }
+
+    packages_to_query
+}
+
+/// Query available indexes and build a mapping from (package_name, hash) to (index_url, file).
+///
+/// This allows looking up alternative download locations for packages based on their content hash.
+async fn build_hash_to_file_mapping(
+    packages_to_query: &rustc_hash::FxHashMap<uv_normalize::PackageName, bool>,
+    client: &uv_client::RegistryClient,
+) -> rustc_hash::FxHashMap<(uv_normalize::PackageName, String), (uv_distribution_types::IndexUrl, uv_distribution_types::File)> {
+    use rustc_hash::FxHashMap;
+    use uv_distribution_types::{File, IndexCapabilities, IndexUrl};
+
+    let mut hash_to_file: FxHashMap<(uv_normalize::PackageName, String), (IndexUrl, File)> =
+        FxHashMap::default();
+
+    let capabilities = IndexCapabilities::default();
+    let semaphore = tokio::sync::Semaphore::new(50);
+
+    for (package_name, _) in packages_to_query {
+        let results = match client
+            .simple_detail(package_name, None, &capabilities, &semaphore)
+            .await
+        {
+            Ok(results) => results,
+            Err(_) => continue, // Skip packages we can't query
+        };
+
+        for (index_url, metadata) in results {
+            match metadata {
+                uv_client::MetadataFormat::Simple(simple) => {
+                    for datum in simple.iter() {
+                        let files = rkyv::deserialize::<
+                            uv_client::VersionFiles,
+                            rkyv::rancor::Error,
+                        >(&datum.files)
+                        .expect("archived version files always deserializes");
+
+                        for (_, file) in files.all() {
+                            // Store each file by its hashes for lookup
+                            for hash in file.hashes.iter() {
+                                let key = (package_name.clone(), format!("{}", hash));
+                                if !hash_to_file.contains_key(&key) {
+                                    hash_to_file.insert(key, (index_url.clone(), file.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+                uv_client::MetadataFormat::Flat(entries) => {
+                    for entry in entries {
+                        for hash in entry.file.hashes.iter() {
+                            let key = (package_name.clone(), format!("{}", hash));
+                            if !hash_to_file.contains_key(&key) {
+                                hash_to_file.insert(key, (index_url.clone(), entry.file.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    hash_to_file
+}
+
+/// Attempt to remap a built distribution (wheel) to an available index with matching hash.
+fn remap_built_distribution(
+    reg: &uv_distribution_types::RegistryBuiltDist,
+    version: &uv_pep440::Version,
+    available_indexes: &std::collections::HashSet<String>,
+    hash_to_file: &rustc_hash::FxHashMap<(uv_normalize::PackageName, String), (uv_distribution_types::IndexUrl, uv_distribution_types::File)>,
+) -> Option<ResolvedDist> {
+    use uv_distribution_types::{BuiltDist, Name, RegistryBuiltDist, RegistryBuiltWheel};
+
+    let wheel = reg.best_wheel();
+    let index_url_str = wheel.index.url().to_string();
+
+    // Check if this index needs remapping
+    if available_indexes.contains(&index_url_str) {
+        return None; // No remapping needed
+    }
+
+    // Find alternative file by hash
+    for hash in wheel.file.hashes.iter() {
+        let key = (reg.name().clone(), format!("{}", hash));
+        if let Some((new_index, new_file)) = hash_to_file.get(&key) {
+            // Create new wheel with remapped index and file
+            let new_wheel = RegistryBuiltWheel {
+                filename: wheel.filename.clone(),
+                file: Box::new(new_file.clone()),
+                index: new_index.clone(),
+            };
+            let new_dist = RegistryBuiltDist {
+                wheels: vec![new_wheel],
+                best_wheel_index: 0,
+                sdist: None,
+            };
+            return Some(ResolvedDist::Installable {
+                dist: Arc::new(Dist::Built(BuiltDist::Registry(new_dist))),
+                version: version.clone(),
+            });
+        }
+    }
+
+    None // No matching file found, keep original
+}
+
+/// Attempt to remap a source distribution to an available index with matching hash.
+fn remap_source_distribution(
+    reg: &uv_distribution_types::RegistrySourceDist,
+    version: &uv_pep440::Version,
+    available_indexes: &std::collections::HashSet<String>,
+    hash_to_file: &rustc_hash::FxHashMap<(uv_normalize::PackageName, String), (uv_distribution_types::IndexUrl, uv_distribution_types::File)>,
+) -> Option<ResolvedDist> {
+    use uv_distribution_types::RegistrySourceDist;
+
+    let index_url_str = reg.index.url().to_string();
+
+    // Check if this index needs remapping
+    if available_indexes.contains(&index_url_str) {
+        return None; // No remapping needed
+    }
+
+    // Find alternative file by hash
+    for hash in reg.file.hashes.iter() {
+        let key = (reg.name.clone(), format!("{}", hash));
+        if let Some((new_index, new_file)) = hash_to_file.get(&key) {
+            let new_dist = RegistrySourceDist {
+                name: reg.name.clone(),
+                version: reg.version.clone(),
+                file: Box::new(new_file.clone()),
+                ext: reg.ext,
+                index: new_index.clone(),
+                wheels: vec![],
+            };
+            return Some(ResolvedDist::Installable {
+                dist: Arc::new(Dist::Source(SourceDist::Registry(new_dist))),
+                version: version.clone(),
+            });
+        }
+    }
+
+    None // No matching file found, keep original
+}
+
+/// Remap packages whose index is not in available indexes to use an alternative index
+/// with matching hashes. This allows using mirror indexes with `--locked` mode when the
+/// mirror has the same package content as the original index.
+async fn remap_unavailable_indexes(
+    resolution: Resolution,
+    index_locations: &uv_distribution_types::IndexLocations,
+    client: &uv_client::RegistryClient,
+) -> Result<Resolution, ProjectError> {
+    use rustc_hash::FxHashMap;
+    use uv_distribution_types::{
+        BuiltDist, File, IndexCapabilities, IndexUrl, Name, RegistryBuiltDist, RegistryBuiltWheel,
+        RegistrySourceDist,
+    };
+
+    let available_indexes = collect_available_indexes(index_locations);
+
+    // If no indexes are configured, nothing to remap
+    if available_indexes.is_empty() {
+        return Ok(resolution);
+    }
+
+    // Identify packages that need remapping
+    let packages_to_query = identify_packages_needing_remapping(&resolution, &available_indexes);
+
+    // If no packages need remapping, return as-is
+    if packages_to_query.is_empty() {
+        return Ok(resolution);
+    }
+
+    // Query available indexes and build a mapping from (package_name, hash) to (index_url, file)
+    let hash_to_file = build_hash_to_file_mapping(&packages_to_query, client).await;
+
+    // Now remap the resolution using the collected file information
+    Ok(resolution.map(|dist| {
+        let ResolvedDist::Installable { dist, version } = dist else {
+            return None;
+        };
+
+        match dist.as_ref() {
+            Dist::Built(BuiltDist::Registry(reg)) => {
+                remap_built_distribution(reg, version, &available_indexes, &hash_to_file)
+            }
+            Dist::Source(SourceDist::Registry(reg)) => {
+                remap_source_distribution(reg, version, &available_indexes, &hash_to_file)
+            }
+            _ => None,
+        }
+    }))
 }

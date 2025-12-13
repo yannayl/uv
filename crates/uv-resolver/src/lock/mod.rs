@@ -748,6 +748,132 @@ impl Lock {
         self
     }
 
+    /// Remap registry sources to prefer those from a previous lock when the package hashes match.
+    ///
+    /// This prevents unnecessary lockfile updates when the same package is available from
+    /// different registry URLs (e.g., different mirrors or proxies) but has identical content.
+    #[must_use]
+    pub fn with_stable_registry_sources(mut self, previous: &Lock) -> Self {
+        // Build a map from (name, version) to (package, hashes) for packages in the previous lock
+        // that have registry sources.
+        let previous_registry_packages = Self::build_previous_registry_map(previous);
+
+        // Find packages that need source updates (same name/version, matching hashes, different source).
+        let source_updates =
+            Self::find_source_updates(&mut self.packages, &previous_registry_packages);
+
+        // Apply updates to dependencies and rebuild the index.
+        if !source_updates.is_empty() {
+            Self::apply_source_updates(&mut self.packages, &source_updates);
+            self.rebuild_by_id_index();
+        }
+
+        self
+    }
+
+    /// Build a map from (name, version) to (package, hashes) for registry packages in the lock.
+    fn build_previous_registry_map(
+        lock: &Lock,
+    ) -> FxHashMap<(&PackageName, Option<&Version>), (&Package, HashDigests)> {
+        lock.packages
+            .iter()
+            .filter_map(|package| {
+                if matches!(package.id.source, Source::Registry(_)) {
+                    let hashes = package.hashes();
+                    Some((
+                        (&package.id.name, package.id.version.as_ref()),
+                        (package, hashes),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Find packages that need source updates because they have matching hashes
+    /// but different registry sources compared to the previous lock.
+    ///
+    /// Returns a map of old PackageId -> new Source for packages that need updating.
+    /// Also updates the packages in place with the new source and preserved URLs.
+    fn find_source_updates(
+        packages: &mut [Package],
+        previous_registry_packages: &FxHashMap<(&PackageName, Option<&Version>), (&Package, HashDigests)>,
+    ) -> FxHashMap<PackageId, Source> {
+        let mut source_updates: FxHashMap<PackageId, Source> = FxHashMap::default();
+
+        for package in packages {
+            // Only consider packages with registry sources.
+            if !matches!(package.id.source, Source::Registry(_)) {
+                continue;
+            }
+
+            // Look up the previous package by name and version.
+            let key = (&package.id.name, package.id.version.as_ref());
+            if let Some((prev_package, prev_hashes)) = previous_registry_packages.get(&key) {
+                // Check if hashes match (non-empty and equal) and sources differ.
+                if Self::should_update_source(package, prev_package, prev_hashes) {
+                    // Record the update for later dependency fixup.
+                    let old_id = package.id.clone();
+                    let new_source = prev_package.id.source.clone();
+                    source_updates.insert(old_id, new_source.clone());
+
+                    // Update the package source and preserve URLs from previous lock.
+                    package.id.source = new_source;
+                    package.sdist = prev_package.sdist.clone();
+                    package.wheels = prev_package.wheels.clone();
+                }
+            }
+        }
+
+        source_updates
+    }
+
+    /// Check if a package's source should be updated to match the previous lock.
+    ///
+    /// Returns true if:
+    /// - Both packages have non-empty hashes
+    /// - The hashes are equal (same content)
+    /// - The sources are different (different registry URLs)
+    fn should_update_source(
+        current: &Package,
+        previous: &Package,
+        prev_hashes: &HashDigests,
+    ) -> bool {
+        let current_hashes = current.hashes();
+        !current_hashes.is_empty()
+            && !prev_hashes.is_empty()
+            && current_hashes == *prev_hashes
+            && current.id.source != previous.id.source
+    }
+
+    /// Apply source updates to all package dependencies.
+    fn apply_source_updates(
+        packages: &mut [Package],
+        source_updates: &FxHashMap<PackageId, Source>,
+    ) {
+        for package in packages {
+            for dep in package
+                .dependencies
+                .iter_mut()
+                .chain(package.optional_dependencies.values_mut().flatten())
+                .chain(package.dependency_groups.values_mut().flatten())
+            {
+                if let Some(new_source) = source_updates.get(&dep.package_id) {
+                    dep.package_id.source = new_source.clone();
+                }
+            }
+        }
+    }
+
+    /// Rebuild the by_id index after PackageIds have changed.
+    fn rebuild_by_id_index(&mut self) {
+        self.by_id.clear();
+        for (i, package) in self.packages.iter().enumerate() {
+            self.by_id.insert(package.id.clone(), i);
+        }
+    }
+
     /// Returns `true` if this [`Lock`] includes `provides-extra` metadata.
     pub fn supports_provides_extra(&self) -> bool {
         // `provides-extra` was added in Version 1 Revision 1.

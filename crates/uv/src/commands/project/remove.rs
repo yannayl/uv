@@ -372,6 +372,7 @@ pub(crate) async fn remove(
         DryRun::Disabled,
         printer,
         preview,
+        matches!(lock_check, LockCheck::Enabled(_)),
     )
     .await
     {

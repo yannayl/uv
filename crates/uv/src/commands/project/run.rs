@@ -336,6 +336,7 @@ hint: If you are running a script with `{}` in the shebang, you may need to incl
                 DryRun::Disabled,
                 printer,
                 preview,
+                matches!(lock_check, LockCheck::Enabled(_)),
             )
             .await
             {
@@ -864,6 +865,7 @@ hint: If you are running a script with `{}` in the shebang, you may need to incl
                     DryRun::Disabled,
                     printer,
                     preview,
+                    matches!(lock_check, LockCheck::Enabled(_)),
                 )
                 .await
                 {

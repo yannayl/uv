@@ -677,6 +677,7 @@ async fn lock_and_sync(
         DryRun::Disabled,
         printer,
         preview,
+        matches!(lock_check, LockCheck::Enabled(_)),
     )
     .await
     {
